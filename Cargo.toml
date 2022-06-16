@@ -10,3 +10,10 @@ crate-type = [ "lib" ]
 des = "0.8"
 cbc = "0.1"
 bitvec = "1"
+
+[dev-dependencies]
+criterion = "0.*"
+
+[[bench]]
+name = "bench_diversifier"
+harness = false

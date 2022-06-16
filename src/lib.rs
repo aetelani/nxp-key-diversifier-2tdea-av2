@@ -1,8 +1,10 @@
 // © 2022 Anssi Eteläniemi <aetelani@hotmail.com>
 #![feature(test)]
+#![feature(once_cell)]
 
 extern crate test;
 
+use std::lazy::SyncOnceCell;
 use bitvec::macros::internal::funty::Fundamental;
 use bitvec::prelude::*;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit};
@@ -10,7 +12,7 @@ use des::cipher::{Block, BlockEncrypt, KeyInit};
 use des::cipher::block_padding::ZeroPadding;
 use des::TdesEde2;
 
-type SubKey = Vec<u8>;
+pub type SubKey = Vec<u8>;
 
 #[derive(Debug)]
 pub struct SubKeys(SubKey,
@@ -18,6 +20,8 @@ pub struct SubKeys(SubKey,
                SubKey);
 
 type Tdes2EdeCbcEnc = cbc::Encryptor<TdesEde2>;
+static mut ENCTDES2EDECBC: SyncOnceCell<Tdes2EdeCbcEnc> = SyncOnceCell::new();
+static mut ENCTDES2EDE: SyncOnceCell<TdesEde2> = SyncOnceCell::new();
 
 fn bitshift_des(key: &[u8]) -> SubKey {
     let key_first = key.first().unwrap();
@@ -47,17 +51,21 @@ fn bitshift_des(key: &[u8]) -> SubKey {
     result
 }
 
-fn encrypt_des_cbc(key: &[u8], input: [u8; 16]) -> Vec<u8> {
-    let c0 = Tdes2EdeCbcEnc::new_from_slices(key, &[0_u8; 8]).unwrap();
+fn encrypt_des_cbc(input: [u8; 16]) -> Vec<u8> {
+    let c0 = unsafe { ENCTDES2EDECBC.get().expect("Key(s) not initialized with generate_subkeys_des") };
     let mut inp0 = input.clone();
-    let result = c0.encrypt_padded_mut::<ZeroPadding>(inp0.as_mut_slice(), 16);
+    let result = c0.clone().encrypt_padded_mut::<ZeroPadding>(inp0.as_mut_slice(), 16);
     result.unwrap().to_vec()
 }
 
-fn generate_subkeys_des(key: &[u8]) -> SubKeys {
-    let c = des::TdesEde2::new_from_slice(key).unwrap();
+pub fn generate_subkeys_des(key: &[u8]) -> SubKeys {
+    unsafe {
+        let _ = ENCTDES2EDECBC.take();
+        let _ = ENCTDES2EDE.take();
+    };
+    let _ = unsafe { ENCTDES2EDECBC.set(Tdes2EdeCbcEnc::new_from_slices(key, &[0_u8; 8]).unwrap()) };
+    let c = unsafe { ENCTDES2EDE.get_or_init(|| des::TdesEde2::new_from_slice(key).unwrap()) };
     let input0 = &mut Block::<TdesEde2>::from([0_u8; 8]);
-
     c.encrypt_block(input0.into());
     let input1 = bitshift_des(input0.as_slice());
     let input2= bitshift_des(input1.as_slice());
@@ -65,16 +73,18 @@ fn generate_subkeys_des(key: &[u8]) -> SubKeys {
     SubKeys(input0.to_vec(), input1, input2)
 }
 
-pub fn diversify_2tdea_versionrestore_av2(key: &[u8; 16], subkeys: &SubKeys, divinput: Vec<u8>, version: &Option<u8>, key_result: &mut [u8; 16]) {
+pub fn diversify_2tdea_versionrestore_av2(subkeys: &SubKeys, divinput: Vec<u8>, version: &Option<u8>, key_result: &mut [u8; 16]) {
     let mut result = [8_u8; 16];
 
     let inputd1 = prepare_input_des(&subkeys, &divinput, &0x21);
-    let derived1 = encrypt_des_cbc(key, inputd1);
+    let derived1 = encrypt_des_cbc(inputd1);
     let inputd2 = prepare_input_des(&subkeys, &divinput, &0x22);
-    let derived2 = encrypt_des_cbc(key, inputd2);
+    let derived2 = encrypt_des_cbc(inputd2);
 
     result[..8].copy_from_slice(&derived1[8..]);
     result[8..].copy_from_slice(&derived2[8..]);
+
+
 
     if let Some(version_exists) = version {
         let res = restore_version_des_av2(&result, version_exists);
@@ -82,7 +92,6 @@ pub fn diversify_2tdea_versionrestore_av2(key: &[u8; 16], subkeys: &SubKeys, div
     } else {
         key_result.copy_from_slice(&result);
     }
-
 }
 
 fn restore_version_des_av2(divoutput: &[u8; 16], version: &u8) -> [u8; 16] {
@@ -98,6 +107,7 @@ fn restore_version_des_av2(divoutput: &[u8; 16], version: &u8) -> [u8; 16] {
 }
 
 fn prepare_input_des(subkeys: &SubKeys, divinput: &Vec<u8>, divconst: &u8) -> [u8; 16] {
+    const DIVERSIFIER_MAX_LEN: usize = 15; // if longer then panic TODO: Result
     let mut result = [0_u8; 16];
     let subkey;
 
@@ -105,7 +115,8 @@ fn prepare_input_des(subkeys: &SubKeys, divinput: &Vec<u8>, divconst: &u8) -> [u
     result[0] = *divconst;
     result[1..divinput_offset].copy_from_slice(divinput);
 
-    let mut padding = vec![0_u8; 15 - divinput.len()];
+    let padding_len = DIVERSIFIER_MAX_LEN.checked_sub(divinput.len()).expect("Diversifier too long");
+    let mut padding = vec![0_u8; padding_len];
     if let Some(p) = padding.first_mut() {
         *p = 0x80_u8;
         result[divinput_offset..].copy_from_slice(&padding);
@@ -134,7 +145,7 @@ mod tests {
         let result = &mut [0_u8; 16];
 
         let sk = generate_subkeys_des(s_key);
-        diversify_2tdea_versionrestore_av2(s_key, &sk, s_div.to_vec(), &version,result);
+        diversify_2tdea_versionrestore_av2(&sk, s_div.to_vec(), &version,result);
         assert_eq!(result.to_vec(), target.to_vec());
     }
 
@@ -148,7 +159,7 @@ mod tests {
         let result = &mut [0_u8; 16];
 
         let sk = generate_subkeys_des(s_key);
-        diversify_2tdea_versionrestore_av2(s_key, &sk, s_div.to_vec(), &version, result);
+        diversify_2tdea_versionrestore_av2( &sk, s_div.to_vec(), &version, result);
         assert_eq!(result.to_vec(), target.to_vec());
     }
 
@@ -160,7 +171,7 @@ mod tests {
 
         let result = &mut [0_u8; 16];
 
-        let sk = generate_subkeys_des(s_key);
-        b.iter(|| diversify_2tdea_versionrestore_av2(s_key, &sk,s_div.to_vec(), &version,result));
+        let sk = generate_subkeys_des(s_key); // Initializes Encoders and generates keys
+        b.iter(|| diversify_2tdea_versionrestore_av2(&sk,s_div.to_vec(), &version,result));
     }
 }
